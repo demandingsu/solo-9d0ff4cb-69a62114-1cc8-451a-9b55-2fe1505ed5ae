@@ -8,7 +8,10 @@
 - 列表页按发布时间倒序排列（更正公告排在其引用的原公告之前），
   服务端不能依赖页面顺序来判断截止时间；
 - 每个项目的“生效截止时间”由发布时间最新的那份公告（原公告或更正公告）决定；
-- 含已过期与未过期两种项目。
+- 含已过期与未过期两种项目；
+- 原公告详情页含资格条件表：SZ-2026-001 有两个标段（跨标段），
+  并分别在施工资质组提供公路工程、环保工程替代资质；SZ-2026-002 提供
+  水利水电工程施工总承包替代资质，用于资格核验接口示例。
 """
 from __future__ import annotations
 
@@ -22,6 +25,27 @@ OUT_DIR = Path(__file__).resolve().parent.parent / "demo_site"
 
 
 @dataclass
+class QualificationCandidate:
+    category: str                  # 证书类别
+    level: int                     # 门槛等级：数字越小等级越高
+    alternative: bool = False      # 是否作为替代资质
+
+
+@dataclass
+class QualificationGroup:
+    name: str                      # 资格条件组名称
+    clause: str                    # 条款来源
+    candidates: list[QualificationCandidate]
+
+
+@dataclass
+class QualificationSection:
+    no: str                        # 标段号（规范化为 1、2 ...）
+    name: str                      # 标段名称（一标段、二标段 ...）
+    groups: list[QualificationGroup]
+
+
+@dataclass
 class Announcement:
     code: str                      # 公告编号
     title: str                     # 公告标题
@@ -31,6 +55,7 @@ class Announcement:
     deadline: str | None = None    # 投标截止时间（更正公告可为空）
     corrects_code: str | None = None  # 更正公告引用的原公告编号
     reason: str = ""               # 更正原因（仅更正公告）
+    sections: list[QualificationSection] = field(default_factory=list)
 
     @property
     def filename(self) -> str:
@@ -49,6 +74,59 @@ ANNOUNCEMENTS: list[Announcement] = [
         project_name="滨河路市政改造工程",
         published_at="2026-10-20 09:00",
         deadline="2026-11-05 14:30",
+        # 跨标段示例：同一原公告分两个标段，资格审查条件不同
+        sections=[
+            QualificationSection(
+                no="1",
+                name="一标段",
+                groups=[
+                    QualificationGroup(
+                        name="施工资质",
+                        clause="招标公告第三章 资格审查办法 2.1",
+                        candidates=[
+                            QualificationCandidate("市政公用工程施工总承包", 2),
+                            QualificationCandidate(
+                                "公路工程施工总承包", 2, alternative=True
+                            ),
+                        ],
+                    ),
+                    QualificationGroup(
+                        name="项目经理资格",
+                        clause="招标公告第三章 资格审查办法 2.2",
+                        candidates=[
+                            QualificationCandidate(
+                                "市政公用工程专业注册建造师", 1
+                            ),
+                        ],
+                    ),
+                ],
+            ),
+            QualificationSection(
+                no="2",
+                name="二标段",
+                groups=[
+                    QualificationGroup(
+                        name="施工资质",
+                        clause="招标公告第三章 资格审查办法 3.1",
+                        candidates=[
+                            QualificationCandidate("市政公用工程施工总承包", 2),
+                            QualificationCandidate(
+                                "环保工程专业承包", 2, alternative=True
+                            ),
+                        ],
+                    ),
+                    QualificationGroup(
+                        name="项目经理资格",
+                        clause="招标公告第三章 资格审查办法 3.2",
+                        candidates=[
+                            QualificationCandidate(
+                                "市政公用工程专业注册建造师", 1
+                            ),
+                        ],
+                    ),
+                ],
+            ),
+        ],
     ),
     Announcement(
         code="SZ-2026-001-G1",
@@ -68,6 +146,25 @@ ANNOUNCEMENTS: list[Announcement] = [
         project_name="城北污水处理厂扩建工程",
         published_at="2026-10-12 10:30",
         deadline="2026-11-10 09:00",
+        # 替代资质示例：施工资质组接受两类证书，满足任一即可
+        sections=[
+            QualificationSection(
+                no="1",
+                name="一标段",
+                groups=[
+                    QualificationGroup(
+                        name="施工资质",
+                        clause="招标公告第三章 资格审查办法 2.1",
+                        candidates=[
+                            QualificationCandidate("市政公用工程施工总承包", 1),
+                            QualificationCandidate(
+                                "水利水电工程施工总承包", 2, alternative=True
+                            ),
+                        ],
+                    ),
+                ],
+            ),
+        ],
     ),
     Announcement(
         code="SZ-2026-002-G1",
@@ -139,6 +236,64 @@ ANNOUNCEMENTS: list[Announcement] = [
 ]
 
 
+_LEVEL_CN = {1: "一", 2: "二", 3: "三", 4: "四", 5: "五"}
+
+
+def _level_label(level: int) -> str:
+    return f"{_LEVEL_CN.get(level, str(level))}级"
+
+
+def _qualification_html(a: Announcement) -> str:
+    """渲染原公告的资格条件表；更正公告没有资格表。"""
+    if not a.sections:
+        return ""
+    tables: list[str] = []
+    for section in a.sections:
+        group_rows: list[str] = []
+        for group in section.groups:
+            candidates = []
+            for candidate in group.candidates:
+                label = f"{candidate.category}{_level_label(candidate.level)}及以上"
+                if candidate.alternative:
+                    label += "（替代资质）"
+                alt_attr = ' data-alternative="true"' if candidate.alternative else ""
+                candidates.append(
+                    f'              <span class="candidate" '
+                    f'data-category="{html.escape(candidate.category)}" '
+                    f'data-level="{candidate.level}"{alt_attr}>'
+                    f"{html.escape(label)}</span>"
+                )
+            group_rows.append(
+                f'        <tr class="qual-group" '
+                f'data-group="{html.escape(group.name)}" '
+                f'data-clause="{html.escape(group.clause)}">\n'
+                f'          <td class="group-name">{html.escape(group.name)}</td>\n'
+                f'          <td class="clause-source">{html.escape(group.clause)}</td>\n'
+                f'          <td class="candidate-list">\n'
+                f"{chr(10).join(candidates)}\n"
+                f"          </td>\n"
+                f"        </tr>"
+            )
+        tables.append(
+            f'    <table class="qualification-table" '
+            f'data-section="{html.escape(section.no)}" '
+            f'data-section-name="{html.escape(section.name)}">\n'
+            f"      <caption>{html.escape(section.name)}资格审查条件</caption>\n"
+            f"      <thead>\n"
+            f"        <tr><th>资格条件组</th><th>条款来源</th><th>候选条件（满足任一）</th></tr>\n"
+            f"      </thead>\n"
+            f"      <tbody>\n"
+            f"{chr(10).join(group_rows)}\n"
+            f"      </tbody>\n"
+            f"    </table>"
+        )
+    return (
+        '    <h2 class="qualification-title">标段划分与资格审查条件</h2>\n'
+        + "\n".join(tables)
+        + "\n"
+    )
+
+
 def _detail_page(a: Announcement) -> str:
     rows = [
         ("公告编号", a.code),
@@ -172,7 +327,7 @@ def _detail_page(a: Announcement) -> str:
     <table class="detail-table">
 {trs}
     </table>
-    <p><a href="list_1.html">返回列表</a></p>
+{_qualification_html(a)}    <p><a href="list_1.html">返回列表</a></p>
   </article>
 </body>
 </html>

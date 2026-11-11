@@ -139,6 +139,15 @@ def _parse_detail(html_text: str, detail_url: str) -> ParsedAnnouncement:
     )
 
 
+def fetch_page(url: str) -> str:
+    """读取单个页面（供资格核验按需获取原公告详情）。失败抛 CollectionError。"""
+    headers = {"User-Agent": settings.user_agent}
+    with httpx.Client(
+        timeout=settings.request_timeout, follow_redirects=True, headers=headers
+    ) as client:
+        return _get(client, url)
+
+
 def collect(list_url: str) -> list[dict[str, Any]]:
     """抓取整个公告站并返回结构化公告列表（顺序不保证，归并层不依赖顺序）。"""
     headers = {"User-Agent": settings.user_agent}

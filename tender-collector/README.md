@@ -1,8 +1,10 @@
 # 市政工程投标截止时间采集服务
 
-面向招投标专员的公告采集 API：提交市政工程公告站的**列表页地址**，服务自动遍历
-所有分页与详情页，将**更正公告按其引用的原公告编号归并**到同一项目，并**按发布
-时间**（而非页面排列顺序）确定当前生效的投标截止时间，标记是否已过期。
+面向招投标专员的公告采集与资格核验 API：提交市政工程公告站的**列表页地址**，
+服务自动遍历所有分页与详情页，将**更正公告按其引用的原公告编号归并**到同一
+项目，并**按发布时间**（而非页面排列顺序）确定当前生效的投标截止时间，标记
+是否已过期。采集完成后，可提交企业证书核验其是否满足原公告指定标段的全部
+资格条件。
 
 ## 核心规则
 
@@ -19,16 +21,23 @@
 6. **失败保留**：任一列表页/详情页读取失败（网络错误、非 2xx、字段缺失）或
    归并校验失败时，本次采集不写入任何公告数据，**完整保留上次成功采集结果**；
    失败原因记入 `collection_runs` 表并通过 HTTP 422 返回。
+7. **资格核验**：以已采集的**原公告编号** + **标段号**定位原公告详情页中的
+   标段资格表，逐组核验企业证书。每组满足任一候选即可，所有组均须满足；
+   同类别证书等级数字越小越高；证书有效期不得早于**更正归并后**的投标截止
+   日期。详情页读取失败、资格表/标段/候选字段缺项时返回“无法判定”，不会
+   误判为不满足。
 
 ## 目录结构
 
 ```
 tender-collector/
 ├── app/                    # FastAPI 应用
-│   ├── main.py             # 路由：/api/collect、/api/projects、/api/collections
-│   ├── service.py          # 采集编排 + 事务边界 + 过期判定
+│   ├── main.py             # 路由：/api/collect、/api/projects、/api/collections、
+│   │                       #       /api/qualifications/verify
+│   ├── service.py          # 采集编排 + 事务边界 + 过期判定 + 资格核验编排
 │   ├── scraper.py          # httpx + BeautifulSoup 抓取/解析
 │   ├── merge.py            # 更正归并与生效截止时间判定（纯函数）
+│   ├── qualification.py    # 资格表解析 + 证书逐组判定（纯函数）
 │   ├── database.py         # SQLite 连接、建表、UPSERT
 │   ├── models.py           # Pydantic 模型
 │   └── config.py           # 环境变量配置
@@ -56,11 +65,24 @@ curl -X POST http://localhost:8000/api/collect \
 
 # 4. 查询项目当前截止时间
 curl http://localhost:8000/api/projects
+
+# 5. 核验企业证书是否满足原公告某标段（001 一标段允许公路资质替代）
+curl -X POST http://localhost:8000/api/qualifications/verify \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "announcement_code": "SZ-2026-001",
+    "section_no": "1",
+    "certificates": [
+      {"category": "市政公用工程施工总承包", "level": 2, "valid_until": "2026-11-25"},
+      {"category": "市政公用工程专业注册建造师", "level": 1, "valid_until": "2026-11-25"}
+    ]
+  }'
 ```
 
 容器内 API 通过 compose 网络访问示例站（主机名 `demo-site`）；从宿主机浏览
 示例站则打开 <http://localhost:8001/list_1.html>。SQLite 数据存于命名卷
-`tender-data`（容器内 `/data/tenders.db`）。
+`tender-data`（容器内 `/data/tenders.db`）。采集与资格核验均只访问 compose
+内的本地示例站，**可离线运行**；验证资格表会实时读取原公告详情页。
 
 停止与清理：
 
@@ -135,6 +157,111 @@ curl -X POST http://localhost:8000/api/collect \
 
 包含每次采集的成功/失败状态、采集条数与错误信息。
 
+### `POST /api/qualifications/verify` — 核验企业资质
+
+请求传入**已采集的原公告编号**、**标段号**及企业证书（类别、等级、有效期）。
+服务实时读取该原公告详情页中的标段资格表，并使用与 `/api/projects` 相同的
+**更正归并后**投标截止时间进行判定。
+
+```json
+{
+  "announcement_code": "SZ-2026-001",
+  "section_no": "1",
+  "certificates": [
+    {
+      "category": "市政公用工程施工总承包",
+      "level": 2,
+      "valid_until": "2026-11-25"
+    },
+    {
+      "category": "市政公用工程专业注册建造师",
+      "level": 1,
+      "valid_until": "2026-11-25"
+    }
+  ]
+}
+```
+
+说明：
+
+- `section_no` 支持 `1`、`01`、`G1`、`一标段`、`标段一` 等写法；
+- 也可用顶层单证书简写：`category` / `level` / `valid_until`，或
+  `certificate` 对象；`level` 支持 `2`、`"2"`、`"二级"`；
+- `valid_until` 支持 `YYYY-MM-DD`、`YYYY-MM-DD HH:MM` 等格式，按**日期**
+  比较（有效期当日仍有效）。
+
+成功判定（200）：
+
+```json
+{
+  "status": "satisfied",
+  "verdict": "满足",
+  "can_satisfy": true,
+  "announcement_code": "SZ-2026-001",
+  "section_no": "1",
+  "section_name": "一标段",
+  "matched_section_no": "1",
+  "project_name": "滨河路市政改造工程",
+  "deadline": "2026-11-25 14:30",
+  "deadline_source_code": "SZ-2026-001-G1",
+  "deadline_source_url": "http://demo-site/SZ-2026-001-G1.html",
+  "detail_url": "http://demo-site/SZ-2026-001.html",
+  "groups": [
+    {
+      "group": "施工资质",
+      "clause_source": "招标公告第三章 资格审查办法 2.1",
+      "satisfied": true,
+      "matched_candidate": {
+        "category": "市政公用工程施工总承包",
+        "level": 2,
+        "level_text": "2级",
+        "text": "市政公用工程施工总承包二级及以上"
+      }
+    }
+  ],
+  "unmet_conditions": [],
+  "reason": null
+}
+```
+
+未满足时 `status` 为 `unsatisfied`、`can_satisfy` 为 `false`，
+`unmet_conditions` 逐项给出未满足的组、要求、原因及 `clause_source`（条款来源）：
+
+```json
+{
+  "status": "unsatisfied",
+  "verdict": "不满足",
+  "can_satisfy": false,
+  "unmet_conditions": [
+    {
+      "group": "项目经理资格",
+      "clause_source": "招标公告第三章 资格审查办法 2.2",
+      "requirement": "满足任一：市政公用工程专业注册建造师一级及以上",
+      "candidates": [
+        {
+          "category": "市政公用工程专业注册建造师",
+          "level": 1,
+          "level_text": "1级",
+          "text": "市政公用工程专业注册建造师一级及以上"
+        }
+      ],
+      "reason": "企业证书类别未覆盖本组任一候选条件"
+    }
+  ]
+}
+```
+
+判定规则：
+
+- **每组满足任一候选即可，所有组均须满足**；替代资质（如公路工程、水利
+  水电工程施工总承包）与主资质同组并列，任一即可；
+- **等级数字越小越高**：候选“二级及以上”接受一级、二级，拒绝三级；
+- 证书有效期必须 **>=** 生效投标截止日期（含同日）；
+- 原公告未采集或编号不是原公告：HTTP 404；
+- **详情页读取失败、资格表不存在、标段不存在、候选缺类别/等级时**：
+  `status` 为 `undetermined`、`can_satisfy` 为 `null`，并在 `reason` 中说明，
+  **不会误判为不满足**。即使详情页读取失败，只要归并截止时间可得仍会返回。
+
 ## 示例站数据设计
 
 `demo_site/` 含 5 个项目、10 条公告、3 个列表页，列表按发布时间**倒序**排列
@@ -147,6 +274,19 @@ curl -X POST http://localhost:8000/api/collect \
 | 东风桥加固维修工程 | 无更正，已过期 | 原公告 SZ-2026-003 |
 | 高新区雨污分流管网工程 | 更正不改截止时间 | 原公告 SZ-2026-004 |
 | 湖滨公园配套市政道路工程 | 原公告在末页、更正在首页（跨页乱序） | 更正公告 SZ-2026-005-G1 |
+
+资格核验示例数据（写在原公告详情页的 `table.qualification-table` 中）：
+
+| 原公告 | 标段 | 资格条件 | 说明 |
+| --- | --- | --- | --- |
+| SZ-2026-001 | 1（一标段） | 施工资质：市政公用工程施工总承包二级及以上**或**公路工程施工总承包二级及以上（替代）；项目经理：市政公用工程专业注册建造师一级及以上 | 跨标段 + 替代资质 |
+| SZ-2026-001 | 2（二标段） | 施工资质：市政公用工程施工总承包二级及以上**或**环保工程专业承包二级及以上（替代）；项目经理：市政公用工程专业注册建造师一级及以上 | 与一标段条件不同 |
+| SZ-2026-002 | 1（一标段） | 施工资质：市政公用工程施工总承包一级及以上**或**水利水电工程施工总承包二级及以上（替代） | 替代资质 |
+| SZ-2026-003/004/005 | — | 原公告未提供资格表 | 用于验证“无法判定” |
+
+SZ-2026-001 的生效截止时间为更正后的 `2026-11-25 14:30`。因此证书有效期
+`2026-11-20` 不满足（尽管它晚于原公告的 `2026-11-05`），`2026-11-25`
+当日仍满足。
 
 ## 环境变量
 
@@ -167,3 +307,9 @@ curl -X POST http://localhost:8000/api/collect \
   `data-code` / `data-kind` / `data-published-at` / `data-corrects` 属性，
   以及 `table.detail-table` 内 `th[data-field="字段名"] + td` 表格字段
   （公告编号、公告类型、项目名称、发布时间、投标截止时间、原公告编号）。
+- 资格表：`table.qualification-table`，以 `data-section`（标段号）/
+  `data-section-name`（标段名称）标识标段；表内 `tr.qual-group` 为一个
+  资格条件组，`data-group` 为组名、`data-clause` 为条款来源；组内
+  `span.candidate` 为候选条件，`data-category` 为证书类别、`data-level`
+  为门槛等级（数字越小等级越高）。解析器也兼容把类别/等级写在候选文本中
+  （如“市政公用工程施工总承包二级及以上”）的写法。
